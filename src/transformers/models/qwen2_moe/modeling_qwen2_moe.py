@@ -631,15 +631,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 Supported shapes:
                     - (batch * seq, num_experts)
                     - (batch, seq, num_experts)
-                When provided we will BYPASS self.gate() and reuse these logits for selecting experts.
+                When provided, expert SELECTION will be based on injected logits, but original gate weights are used.
         Returns:
-            (final_hidden_states, router_logits) where router_logits are the (batch*seq, num_experts) logits actually used.
+            (final_hidden_states, router_logits) where router_logits are the original gate logits.
         """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         flat_hidden = hidden_states.view(-1, hidden_dim)
 
+        # Always compute fresh router logits from current hidden states
+        router_logits = self.gate(flat_hidden)
+
         if injected_router_logits is not None:
-            # Normalize shape
+            # Normalize injected logits shape
             if injected_router_logits.dim() == 3:
                 # (batch, seq, num_experts) -> (batch*seq, num_experts)
                 injected_router_logits = injected_router_logits.view(-1, injected_router_logits.size(-1))
@@ -651,14 +654,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 raise ValueError(
                     f"Injected router logits second dim {injected_router_logits.shape[1]} != num_experts {self.num_experts}"
                 )
-            router_logits = injected_router_logits.to(flat_hidden.dtype)
+            
+            # Use injected logits for expert selection only
+            injected_routing_weights = F.softmax(injected_router_logits.to(flat_hidden.dtype), dim=1, dtype=torch.float)
+            _, selected_experts = torch.topk(injected_routing_weights, self.top_k, dim=-1)
+            
+            # But compute routing weights from original router_logits
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            # Extract weights for the selected experts
+            batch_indices = torch.arange(routing_weights.size(0), device=routing_weights.device).unsqueeze(1)
+            routing_weights = routing_weights[batch_indices, selected_experts]
         else:
-            # compute fresh logits
-            router_logits = self.gate(flat_hidden)
+            # Normal path: use router_logits for both selection and weights
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
 
-        # Compute routing weights from (possibly injected) logits
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         if self.norm_topk_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(flat_hidden.dtype)
