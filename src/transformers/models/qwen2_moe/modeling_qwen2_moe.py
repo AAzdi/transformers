@@ -617,50 +617,71 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             [Qwen2MoeMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
         )
 
-        # self.shared_expert = Qwen2MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
-        # self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+        self.shared_expert_intermediate_size = config.shared_expert_intermediate_size
+        if self.shared_expert_intermediate_size > 0:
+            self.shared_expert = Qwen2MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
+            self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """ """
+    def forward(self, hidden_states: torch.Tensor, injected_router_logits: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward of Sparse MoE block.
+
+        Args:
+            hidden_states: (batch, seq, hidden)
+            injected_router_logits: Optional tensor providing pre-computed router logits to REPLAY routing.
+                Supported shapes:
+                    - (batch * seq, num_experts)
+                    - (batch, seq, num_experts)
+                When provided we will BYPASS self.gate() and reuse these logits for selecting experts.
+        Returns:
+            (final_hidden_states, router_logits) where router_logits are the (batch*seq, num_experts) logits actually used.
+        """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-        # router_logits: (batch * sequence_length, n_experts)
-        router_logits = self.gate(hidden_states)
+        flat_hidden = hidden_states.view(-1, hidden_dim)
 
+        if injected_router_logits is not None:
+            # Normalize shape
+            if injected_router_logits.dim() == 3:
+                # (batch, seq, num_experts) -> (batch*seq, num_experts)
+                injected_router_logits = injected_router_logits.view(-1, injected_router_logits.size(-1))
+            if injected_router_logits.shape[0] != batch_size * sequence_length:
+                raise ValueError(
+                    f"Injected router logits first dim {injected_router_logits.shape[0]} != batch_size*seq_len {batch_size*sequence_length}"
+                )
+            if injected_router_logits.shape[1] != self.num_experts:
+                raise ValueError(
+                    f"Injected router logits second dim {injected_router_logits.shape[1]} != num_experts {self.num_experts}"
+                )
+            router_logits = injected_router_logits.to(flat_hidden.dtype)
+        else:
+            # compute fresh logits
+            router_logits = self.gate(flat_hidden)
+
+        # Compute routing weights from (possibly injected) logits
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         if self.norm_topk_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        # we cast back to the input dtype
-        routing_weights = routing_weights.to(hidden_states.dtype)
+        routing_weights = routing_weights.to(flat_hidden.dtype)
 
         final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+            (batch_size * sequence_length, hidden_dim), dtype=flat_hidden.dtype, device=flat_hidden.device
         )
 
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
-        # Loop over all available experts in the model and perform the computation on each expert
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
             idx, top_x = torch.where(expert_mask[expert_idx])
-
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+            if top_x.numel() == 0:
+                continue
+            current_state = flat_hidden[None, top_x].reshape(-1, hidden_dim)
             current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(flat_hidden.dtype))
 
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-
-        # shared_expert_output = self.shared_expert(hidden_states)
-        # shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
-
-        # final_hidden_states = final_hidden_states + shared_expert_output
+        if self.shared_expert_intermediate_size > 0:
+            shared_expert_output = self.shared_expert(flat_hidden)
+            shared_expert_output = F.sigmoid(self.shared_expert_gate(flat_hidden)) * shared_expert_output
+            final_hidden_states = final_hidden_states + shared_expert_output
 
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
@@ -694,6 +715,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        replay_router_logits_tensor: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -742,10 +764,13 @@ class Qwen2MoeDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
-        if isinstance(hidden_states, tuple):
-            hidden_states, router_logits = hidden_states
+        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+            hidden_states = self.mlp(hidden_states, injected_router_logits=replay_router_logits_tensor)
         else:
+            hidden_states = self.mlp(hidden_states)
+        if isinstance(hidden_states, tuple):  # sparse path returns tuple
+            hidden_states, router_logits = hidden_states
+        else:  # dense path
             router_logits = None
 
         hidden_states = residual + hidden_states
@@ -934,6 +959,7 @@ class Qwen2MoeModel(Qwen2MoePreTrainedModel):
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        replay_router_logits: Optional[Union[Tuple[torch.Tensor, ...], List[torch.Tensor]]] = None,
     ) -> Union[Tuple, MoeModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_router_logits = (
@@ -996,9 +1022,19 @@ class Qwen2MoeModel(Qwen2MoePreTrainedModel):
         all_router_logits = () if output_router_logits else None
         next_decoder_cache = None
 
+        sparse_layer_idx = 0
         for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+
+            current_replay_router_logits = None
+            if replay_router_logits is not None and isinstance(decoder_layer.mlp, Qwen2MoeSparseMoeBlock):
+                if sparse_layer_idx >= len(replay_router_logits):
+                    raise ValueError(
+                        f"Provided replay_router_logits length {len(replay_router_logits)} < required sparse layers index {sparse_layer_idx+1}"
+                    )
+                current_replay_router_logits = replay_router_logits[sparse_layer_idx]
+                sparse_layer_idx += 1
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -1012,6 +1048,7 @@ class Qwen2MoeModel(Qwen2MoePreTrainedModel):
                     use_cache,
                     cache_position,
                     position_embeddings,
+                    current_replay_router_logits,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1024,6 +1061,7 @@ class Qwen2MoeModel(Qwen2MoePreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
+                    replay_router_logits_tensor=current_replay_router_logits,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1269,6 +1307,7 @@ class Qwen2MoeForCausalLM(Qwen2MoePreTrainedModel, GenerationMixin):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        replay_router_logits: Optional[Union[Tuple[torch.Tensor, ...], List[torch.Tensor]]] = None,
         **loss_kwargs,
     ) -> Union[Tuple, MoeCausalLMOutputWithPast]:
         r"""
@@ -1326,6 +1365,7 @@ class Qwen2MoeForCausalLM(Qwen2MoePreTrainedModel, GenerationMixin):
             output_router_logits=output_router_logits,
             return_dict=return_dict,
             cache_position=cache_position,
+            replay_router_logits=replay_router_logits,
         )
 
         hidden_states = outputs[0]
